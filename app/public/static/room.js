@@ -380,7 +380,7 @@ function openEditDialog(messageId) {
     editingMessageId = messageId;
 
     // Ищем текущий текст сообщения в DOM
-    const msgEl = document.querySelector(`.message[data-messageid="${messageId}"]`);
+    const msgEl = document.querySelector(`.message[data-message-id="${messageId}"]`);
     if (!msgEl) return;
 
     const textSpan = msgEl.querySelector(".message-text");

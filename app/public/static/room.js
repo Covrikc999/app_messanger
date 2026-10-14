@@ -1,5 +1,6 @@
 const API_BASE = window.location.origin;
 
+let currentUserTelegramId = null;
 const roomId = new URLSearchParams(window.location.search).get("id");
 const clientId = crypto.randomUUID
     ? crypto.randomUUID()
@@ -30,8 +31,26 @@ async function fetchWithAuth(url, options = {}) {
     });
 }
 
+async function loadCurrentUserProfile() {
+    try {
+        const res = await fetchWithAuth(`${API_BASE}/api/profile`);
+        
+        if (!res.ok) {
+            console.error("Не удалось загрузить профиль");
+            return;
+        }
+        
+        const profile = await res.json();
+        currentUserTelegramId = profile.telegram_id;
+        
+    } catch (error) {
+        console.error("Ошибка загрузки профиля:", error);
+    }
+}
+
 async function loadRoomDetails() {
     const res = await fetchWithAuth(`${API_BASE}/rooms/${roomId}`);
+
     if (res.status === 401) {
         localStorage.removeItem("access_token");
         window.location.href = "/";
@@ -58,28 +77,77 @@ async function loadMessages(reset = false) {
 
     const messages = await res.json();
     const container = document.getElementById("roomMessages");
-    if (reset) {
-        container.replaceChildren();
-        lastMessageId = 0;
-    }
 
-    messages.forEach(msg => {
-        if (msg.id <= lastMessageId) return;
+    // Сохраняем позицию скролла, чтобы polling не сбрасывал чтение
+    const scrollTop = container.scrollTop;
+    const wasAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 30;
 
-        container.querySelector(".empty-state")?.remove();
-        const el = document.createElement("div");
-        el.className = "message";
-        const author = msg.author_full_name || `Пользователь ${msg.user_id}`;
-        el.textContent = `${author}: ${msg.text}`;
-        container.appendChild(el);
-        lastMessageId = Math.max(lastMessageId, msg.id);
-    });
+    container.replaceChildren();
 
-    if (lastMessageId === 0 && !container.children.length) {
+    if (messages.length === 0) {
         const empty = document.createElement("p");
         empty.className = "empty-state";
         empty.textContent = "Пока сообщений нет";
         container.appendChild(empty);
+        lastMessageId = 0;
+        return;
+    }
+
+    messages.forEach(msg => {
+        const el = document.createElement("div");
+        el.className = "message";
+        el.dataset.messageId = msg.id;
+
+        // Имя автора
+        const authorSpan = document.createElement("strong");
+        authorSpan.textContent = msg.author_full_name || `Пользователь ${msg.user_id}`;
+
+        // Текст сообщения
+        const textSpan = document.createElement("span");
+        textSpan.className = "message-text";
+        textSpan.textContent = ": " + msg.text;
+
+        el.appendChild(authorSpan);
+        el.appendChild(textSpan);
+
+        // Отметка «изменено»
+        if (msg.updated_at) {
+            const editedSpan = document.createElement("span");
+            editedSpan.className = "message-edited";
+            editedSpan.textContent = "(изменено)";
+            el.appendChild(editedSpan);
+        }
+
+        // Кнопки действий только для автора
+        if (currentUserTelegramId && msg.user_id === currentUserTelegramId) {
+            const actions = document.createElement("div");
+            actions.className = "message-actions";
+
+            const editBtn = document.createElement("button");
+            editBtn.textContent = "Редактировать";
+            editBtn.dataset.messageId = msg.id;
+            editBtn.dataset.action = "edit";
+
+            const deleteBtn = document.createElement("button");
+            deleteBtn.textContent = "Удалить";
+            deleteBtn.className = "delete-btn";
+            deleteBtn.dataset.messageId = msg.id;
+            deleteBtn.dataset.action = "delete";
+
+            actions.appendChild(editBtn);
+            actions.appendChild(deleteBtn);
+            el.appendChild(actions);
+        }
+
+        container.appendChild(el);
+        lastMessageId = Math.max(lastMessageId, msg.id);
+    });
+
+    // Восстанавливаем позицию скролла
+    if (reset || wasAtBottom) {
+        container.scrollTop = container.scrollHeight;
+    } else {
+        container.scrollTop = scrollTop;
     }
 }
 
@@ -217,6 +285,7 @@ async function enterRoom() {
     document.getElementById("roomMessageForm").addEventListener("submit", sendMessage);
     roomSessionActive = true;
 
+    await loadCurrentUserProfile();
     await loadMessages(true);
     await sendPresenceHeartbeat();
     await pollRoomActivity();
@@ -289,6 +358,119 @@ async function inviteMember() {
     }
 }
 
+
+document.getElementById("roomMessages").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+
+    const messageId = btn.dataset.messageId;
+    const action = btn.dataset.action;
+
+    if (action === "edit") {
+        openEditDialog(messageId);
+    } else if (action === "delete") {
+        await handleDelete(messageId, btn);
+    }
+});
+
+// ===== Редактирование =====
+let editingMessageId = null;
+
+function openEditDialog(messageId) {
+    editingMessageId = messageId;
+
+    // Ищем текущий текст сообщения в DOM
+    const msgEl = document.querySelector(`.message[data-messageid="${messageId}"]`);
+    if (!msgEl) return;
+
+    const textSpan = msgEl.querySelector(".message-text");
+    // Убираем ": " в начале
+    const currentText = textSpan ? textSpan.textContent.slice(2) : "";
+
+    const dialog = document.getElementById("editMessageDialog");
+    const textarea = document.getElementById("editMessageText");
+    const errorEl = document.getElementById("editMessageError");
+
+    textarea.value = currentText;
+    errorEl.textContent = "";
+    dialog.showModal();
+}
+
+document.getElementById("editMessageForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const textarea = document.getElementById("editMessageText");
+    const errorEl = document.getElementById("editMessageError");
+    const submitBtn = e.target.querySelector("button[type='submit']");
+    const text = textarea.value.trim();
+
+    errorEl.textContent = "";
+
+    if (!text) {
+        errorEl.textContent = "Текст не может быть пустым";
+        return;
+    }
+
+    if (text.length > 5000) {
+        errorEl.textContent = "Текст не должен превышать 5000 символов";
+        return;
+    }
+
+    submitBtn.disabled = true;
+
+    try {
+        const response = await fetchWithAuth(
+            `${API_BASE}/rooms/${roomId}/messages/${editingMessageId}`,
+            {
+                method: "PATCH",
+                body: JSON.stringify({ text }),
+            }
+        );
+
+        if (response.ok) {
+            document.getElementById("editMessageDialog").close();
+            await loadMessages(true);
+        } else {
+            const data = await response.json();
+            errorEl.textContent = data.detail || "Ошибка при сохранении";
+        }
+    } catch (error) {
+        errorEl.textContent = "Ошибка сети";
+    } finally {
+        submitBtn.disabled = false;
+    }
+});
+
+document.getElementById("cancelEditMessage").addEventListener("click", () => {
+    document.getElementById("editMessageDialog").close();
+});
+
+// ===== Удаление =====
+async function handleDelete(messageId, btn) {
+    if (!window.confirm("Вы уверены, что хотите удалить это сообщение?")) {
+        return;
+    }
+
+    btn.disabled = true;
+
+    try {
+        const response = await fetchWithAuth(
+            `${API_BASE}/rooms/${roomId}/messages/${messageId}`,
+            { method: "DELETE" }
+        );
+
+        if (response.status === 204 || response.ok) {
+            await loadMessages(true);
+        } else {
+            const data = await response.json();
+            alert(data.detail || "Ошибка при удалении");
+        }
+    } catch (error) {
+        alert("Ошибка сети");
+    } finally {
+        btn.disabled = false;
+    }
+}
 
 
 
